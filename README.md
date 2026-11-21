@@ -16,16 +16,16 @@ Long-distance trains (ICE, IC, EC and similar) at the 25 stations tracked here, 
 |---|---|---|---|
 | May 2026 | 61.1 % | 53.5 % | 51.5 % |
 | June 2026 | 52.6 % | 43.7 % | 40.7 % |
-| July 2026 | 52.6 % | 42.9 % | 40.2 % |
+| July 2026 | 52.6 % | 42.8 % | 40.2 % |
 
 - The big hubs are 7 to 10 points worse than the network average. Delays add up along a route, and the hubs are where most routes meet.
 - Counting cancellations costs another 2 to 3 points every month.
-- The Ruhr stations (Düsseldorf, Essen, Dortmund) are the worst in the set, followed by Köln.
+- Dortmund is the worst station in the set (26.3 % in October), followed by Köln, Düsseldorf and Essen. Berlin-Wannsee and Berlin-Charlottenburg look just as bad, but they see only a few long-distance trains a month, so a handful of late ICs decides their figure.
 - In the week of 22 June every train class dropped at the same time. Long-distance fell to about 27 %.
 - Long-distance trains leave on time in the morning. From midday on, the hubs turn orange on the hour-of-day heatmap and stay that way until late evening.
 - FlixTrain's FLX10 (Berlin to Stuttgart) was on time at 22 % of its stops, and 1 in 5 of its stops was cancelled.
 
-Numbers as of 16 October 2026. August and September are being loaded, and the hourly collector adds a day of data every day.
+Numbers as of 20 November 2026. The archive covers 1 May to 12 October, the collector everything since, and it adds a day of data every day.
 
 ## How it works
 
@@ -39,7 +39,9 @@ flowchart LR
     ARC --> B
     B --> S[Silver]
     S --> G[Gold]
-    G --> D[Databricks dashboard]
+    G --> M[Metric view<br/>bahn.gold.punctuality_metrics]
+    M --> D[Databricks dashboard]
+    M --> GE[Genie space]
 ```
 
 **Collector** (`collector/collect.py`). Runs every hour on GitHub Actions. For each station it calls the change feed (`fchg`) once and the planned timetable (`plan`) for the current hour and the next two. The responses are stored unparsed, one JSON line per call, gzipped, and uploaded to a Unity Catalog volume through the Databricks Files API. The client throttles itself to stay under the API's 60 calls per minute, retries on 429 and 5xx, and stops the run at the first 401 or 403 instead of burning through the quota.
@@ -62,6 +64,10 @@ GitHub's own cron dropped about three out of four scheduled runs, so the workflo
 - For each station and day only one source counts, the collector if it has that day, otherwise the archive.
 - `collection_health` has one row per polled station number and day, including the zeros. A station that answers the API but returns no trains looks like a successful run in the collector's log. Here it shows up as a failed expectation.
 
+**Metric view** (`metrics/punctuality_metrics.sql`). Every KPI is written once as a measure on `stop_events`: punctuality the DB way, punctuality with cancellations, cancelled share, average delay, share 15+ minutes late. The KPIs page of the dashboard and the Genie space both read from it, so they cannot disagree. What each KPI means is in [docs/kpi_definitions.md](docs/kpi_definitions.md).
+
+**Genie space**. Answers questions like "which station had the worst long-distance punctuality last month?" on top of the metric view, with instructions for DB's rules and the known gaps in the data. Setting it up, and the two wrong answers it gave first, are in [docs/genie.md](docs/genie.md).
+
 ## Decisions worth explaining
 
 **Why not just trust the HTTP 200.** Four Berlin stations returned valid, empty timetables for days. Their trains are filed under other station numbers listed in the `meta` attribute of the station lookup. `collect.py expand-meta` adds those numbers. `prune-meta` drops the ones that turn out to be bus stops in front of the station, and stops polling parent numbers that never carry trains themselves.
@@ -70,19 +76,23 @@ GitHub's own cron dropped about three out of four scheduled runs, so the workflo
 
 **Why some days are dropped and others are not.** The archive's May file carries a few late trains from 30 April, and those few are almost all late. The collector started in the middle of 13 October. Such days are only partly covered, so a station's first and last day in a source are dropped if they have less than half its usual traffic. Thin days in the middle are kept. They are usually closures for construction work, like the S-Bahn tunnels in München and Stuttgart on some weekends in May, and travellers live through those.
 
+**Why the metric view sits on single stops.** A percentage cannot be averaged again. Averaging daily station figures gives a small station as much weight as Berlin Hbf. On `stop_events` every measure is recomputed from counts for whatever grouping is asked for, by month, station, hour or all of them.
+
 **Why FlixTrain is a separate class.** DB's figure covers DB trains only.
 
 **Why lines carry a region.** Line numbers repeat across Germany. RE2 runs in Berlin-Brandenburg and in NRW, S1 in five cities.
 
 ## Stack
 
-Python, PySpark, Databricks (Free Edition): Lakeflow Spark Declarative Pipelines, Auto Loader, AUTO CDC, Unity Catalog volumes, AI/BI dashboard. GitHub Actions for collection and tests. pytest with a local Spark session, ruff.
+Python, PySpark, Databricks (Free Edition): Lakeflow Spark Declarative Pipelines, Auto Loader, AUTO CDC, Unity Catalog volumes and metric views, AI/BI dashboard, Genie. GitHub Actions for collection and tests. pytest with a local Spark session, ruff.
 
 ## Repository
 
 ```
 collector/          hourly API collector and stations.csv
 pipelines/          bronze, silver, gold (Lakeflow declarative pipeline)
+metrics/            metric view with the KPI definitions
+docs/               KPI definitions, Genie space setup, screenshots
 transform/          parsing and column logic, kept free of Databricks imports so it can be tested locally
 scripts/            archive backfill
 setup/              catalog, schemas and volumes
@@ -112,6 +122,8 @@ In Databricks, run the two SQL files in `setup/`, then create a pipeline with th
 - 25 stations, chosen as the largest hubs plus the Berlin area. These are not DB's network-wide numbers and should not be compared with them one to one.
 - When the collector misses a run, a stop keeps its last known state. A delay reported only in the missed hour is lost. `collection_health` shows gaps per station and day.
 - Long-distance trains have no line number in the data, so the line ranking covers regional trains, S-Bahn and FlixTrain.
+- From 17 October the data comes from the collector, which records about 7 % fewer long-distance stops per day than the archive. Months on either side of that date are not measured in exactly the same way.
+- Essen Hbf has far fewer long-distance stops than Düsseldorf or Dortmund (574 in October against more than 3,000). That looks too low for an ICE hub and still needs checking.
 - 13 to 16 October 2026 are undercounted. The collector started on 13 October and began polling the S-Bahn parts of big stations on 16 October. On those days a station's partial collector day replaces its full archive day and is then dropped as incomplete. The fix is to check completeness per source before choosing one.
 
 ## Data and licence
